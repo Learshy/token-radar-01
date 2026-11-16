@@ -1,8 +1,8 @@
-// Token Radar's dashboard, radar-4. It reads window.RADAR (written beside dashboard/ by main.ts)
-// and renders the ranked board, a filterable table, a per-protocol detail drawer with the model's
-// own inputs and the protocol's farm plan, and the methodology behind the multiples — including the
-// out-of-sample test the model was scored on and the size curve it is priced from. No network:
-// every byte it shows is in data.js.
+// Token Radar's dashboard, radar-5 hybrid. It reads window.RADAR (written beside dashboard/ by
+// main.ts) and renders the test first — the walk-forward check and the bootstrap, with their
+// numbers — then the ranked board, a filterable table, a per-protocol detail drawer with the
+// model's own inputs and the protocol's farm plan, and the methodology behind the multiples.
+// No network: every byte it shows is in data.js.
 (function () {
   'use strict';
 
@@ -283,9 +283,10 @@
   }
 
   function lede() {
-    var oos = DATA.oos && DATA.oos.methods && DATA.oos.methods[0];
-    var oosLine = oos
-      ? ' Tested out of sample: fitted on the older half of the snapshot\'s dated live tokens, this model predicts the newer half\'s market caps within 2x in ' + oos.within_2x_pct + '% of cases, with a median error of ' + oos.median_factor_error.toFixed(2) + 'x — the methodology panel shows the full test.'
+    var wf = DATA.oos_walk_forward && DATA.oos_walk_forward.aggregate && DATA.oos_walk_forward.aggregate[0];
+    var boot = DATA.bootstrap;
+    var oosLine = wf
+      ? ' Tested out of sample on four walk-forward folds: this model predicts unseen tokens\' market caps within 2x in ' + wf.within_2x_pct + '% of cases, with a mean median error of ' + wf.median_factor_error.toFixed(2) + 'x (worst fold ' + DATA.oos_walk_forward.worst_fold_error.toFixed(2) + 'x).' + (boot ? ' ' + boot.verdict_stable_pct + '% of its farm verdicts survive resampling. ' : '') + 'The test panel below shows the full test.'
       : '';
     return el('section', { class: 'lede' },
       el('div', null,
@@ -420,26 +421,13 @@
     );
   }
 
-  function modelPanel() {
-    var m = DATA.model;
-    var fit = DATA.size_fit;
-    var sizeFormula = 'exp(' + fit.intercept.toFixed(2) + (fit.slope < 0 ? ' - ' : ' + ') + Math.abs(fit.slope).toFixed(2) + ' x log10(tvl))';
-    var multRows = DATA.category_effects.map(function (t) {
-      return el('tr', null,
-        el('td', { text: t.category }),
-        el('td', { class: 'num', text: String(t.live_peers) }),
-        el('td', { class: 'num', text: t.median_residual === null ? 'no live peers' : (t.median_residual >= 0 ? '+' : '') + t.median_residual.toFixed(2) }),
-        el('td', { class: 'num', text: fmtMult(t.effect) })
-      );
-    });
-    var sizeRows = fit.points.map(function (pt) {
-      return el('tr', null,
-        el('td', { text: 'TVL ' + fmtUsd(pt.tvl_usd) }),
-        el('td', { class: 'num', text: fmtMult(pt.multiple) })
-      );
-    });
-    var oos = DATA.oos;
-    var oosRows = oos.methods.map(function (meth) {
+  // The test, first: the walk-forward check and the bootstrap, with their numbers, before any
+  // ranking. A model that hides its error behind its board is not a radar.
+  function testPanel() {
+    var wf = DATA.oos_walk_forward;
+    var boot = DATA.bootstrap;
+    var ms = DATA.oos_median_split;
+    var aggRows = wf.aggregate.map(function (meth) {
       return el('tr', null,
         el('td', { text: meth.name }),
         el('td', { class: 'num', text: String(meth.median_factor_error) + 'x' }),
@@ -447,55 +435,87 @@
         el('td', { class: 'num', text: String(meth.median_ratio) })
       );
     });
-    return el('section', { class: 'panel model', id: 'method' },
-      el('h2', { text: 'How implied value is computed' }),
-      el('p', { class: 'sub', text: 'Every row is scored by one function of the snapshot figures. No protocol name is special-cased, and no row is hand-picked. The program re-derives everything from the snapshot each run: a future snapshot with new protocols re-ranks without code changes.' }),
-      el('div', { class: 'formula' },
-        'implied = round( tvl_usd x min(' + m.multiple_cap + ', size(tvl) x category effect) x (1 + clamp(change_7d, ' + m.growth_floor + ', ' + m.growth_cap + ') / 100 x ' + m.growth_weight + ') x (' + m.maturity_floor + ' + min(age_days, ' + m.maturity_days + ') / ' + m.maturity_days + ' x ' + m.maturity_range + ') x min(' + m.chain_cap + ', 1 + 0.02 x (chains - 1)) )'
-      ),
-      el('div', { class: 'formula' },
-        'size(tvl) = ' + sizeFormula + ', fitted on the snapshot\'s live-token protocols; market cap scales as TVL^' + fit.exponent.toFixed(2) + '.'
-      ),
-      el('p', { class: 'sub', text: 'TVL and seven-day growth come from the snapshot. Age is the time since the protocol was first listed, the best record of how long it has run with no token; an unlisted age uses ' + m.unknown_age_days + ' days. Chain breadth is the number of chains the snapshot counts the protocol on, capped at ' + m.chain_cap + 'x.' }),
-      el('h3', { text: 'The multiple is tested, not asserted' }),
-      el('p', { class: 'sub', text: 'The dated live-token protocols split at their median listing date, ' + oos.cut_date + ': the older half (' + oos.fit_n + ' tokens) fits the multiples, the newer half (' + oos.test_n + ' tokens) is scored without ever having been fitted. The table shows the median factor error — the typical factor by which a prediction misses the real market cap — and the share predicted within 2x. The fitted log-size curve with its category effect cuts the error of the old three-band model by about a third, and of category alone by more than half. A model wrong by ' + oos.methods[0].median_factor_error.toFixed(1) + 'x on average says so here, in its own methodology.' }),
+    var foldRows = wf.folds.map(function (f) {
+      return el('tr', null,
+        el('td', { class: 'num', text: String(f.fold) }),
+        el('td', { text: f.test_from + ' to ' + f.test_to }),
+        el('td', { class: 'num', text: String(f.train_n) + ' (' + f.purged_n + ' purged)' }),
+        el('td', { class: 'num', text: String(f.test_n) }),
+        el('td', { class: 'num', text: String(f.methods[0].median_factor_error) + 'x / ' + f.methods[0].within_2x_pct + '%' }),
+        el('td', { class: 'num', text: String(f.methods[1].median_factor_error) + 'x / ' + f.methods[1].within_2x_pct + '%' })
+      );
+    });
+    var msLine = 'On the single median split (' + ms.fit_n + ' fitted, ' + ms.test_n + ' tested, cut ' + ms.cut_date + '), the hybrid scores ' + ms.methods[0].median_factor_error + 'x / ' + ms.methods[0].within_2x_pct + '% and the category-only model ' + ms.methods[2].median_factor_error + 'x / ' + ms.methods[2].within_2x_pct + '%. One split is one draw from one regime, so the walk-forward above is the headline test; the split stays here so the models can be compared on identical ground.';
+    return el('section', { class: 'panel model', id: 'test' },
+      el('h2', { text: 'The model, tested before the board' }),
+      el('p', { class: 'sub', text: 'The snapshot\'s dated live-token protocols, in listing order, cut into five contiguous chunks. Four expanding folds fit on the older chunks and score the next one, with a 30-day embargo: train peers listed within thirty days of a test fold\'s start are purged, so no fold is fitted on the same month it is scored on. The table shows the mean across folds — the median factor error, the typical factor by which a prediction misses the real market cap, and the share predicted within 2x.' }),
       el('div', { class: 'table-wrap' },
         el('table', { class: 'mult-table' },
           el('thead', null, el('tr', null,
-            el('th', { scope: 'col', text: 'Method' }),
+            el('th', { scope: 'col', text: 'Method (mean across 4 folds)' }),
             el('th', { scope: 'col', text: 'Median error' }),
             el('th', { scope: 'col', text: 'Within 2x' }),
             el('th', { scope: 'col', text: 'Median pred / actual' })
           )),
-          el('tbody', null, oosRows)
+          el('tbody', null, aggRows)
         )
       ),
-      el('h3', { text: 'The size curve' }),
-      el('p', { class: 'sub', text: 'Market cap grows more slowly than TVL. Across the snapshot\'s ' + DATA.live_peer_count + ' live-token protocols, the log of the market-cap-to-TVL ratio falls against the log of TVL with slope ' + fit.slope.toFixed(2) + ', so market cap scales as TVL^' + fit.exponent.toFixed(2) + ': a protocol ten times as big is worth about three times as much, not ten times as much. The line is fitted by least squares on the live peers, and the table shows the multiple it gives at four TVLs. A protocol\'s multiple is the line\'s value at its TVL times its category effect, capped at ' + m.multiple_cap + 'x.' }),
+      el('h3', { text: 'Fold by fold' }),
       el('div', { class: 'table-wrap' },
         el('table', { class: 'mult-table' },
           el('thead', null, el('tr', null,
-            el('th', { scope: 'col', text: 'Protocol size' }),
-            el('th', { scope: 'col', text: 'Multiple from the size line' })
+            el('th', { scope: 'col', text: 'Fold' }),
+            el('th', { scope: 'col', text: 'Test window' }),
+            el('th', { scope: 'col', text: 'Train (purged)' }),
+            el('th', { scope: 'col', text: 'Test' }),
+            el('th', { scope: 'col', text: 'Hybrid' }),
+            el('th', { scope: 'col', text: 'Radar-5 pure' })
           )),
-          el('tbody', null, sizeRows)
+          el('tbody', null, foldRows)
         )
       ),
-      el('h3', { text: 'Where the multiple comes from' }),
-      el('p', { class: 'sub', text: 'Each category sits somewhere off the size line. Its effect is the median of its live peers\' residuals from the fitted line — how far the category trades above or below what its size alone would say — shrunk toward no effect with weight n / (n + ' + m.shrink_prior + '), so a category with one or two peers cannot set its own price. The effect is capped at ' + m.median_cap + 'x and the combined multiple at ' + m.multiple_cap + 'x. A category with no live peers takes no effect (1.00x).' }),
+      el('h3', { text: 'Bootstrap: how much the numbers move' }),
+      el('p', { class: 'sub', text: 'Two hundred seeded resamples. The error band resamples the fitted half and scores the fixed test half: the median error runs ' + boot.error_p10.toFixed(2) + 'x to ' + boot.error_p90.toFixed(2) + 'x (median ' + boot.error_p50.toFixed(2) + 'x), and the share within 2x runs ' + boot.within_p10 + '% to ' + boot.within_p90 + '% (median ' + boot.within_p50 + '%). The verdict check resamples the full live-peer set and recomputes every published verdict: ' + boot.verdict_stable_rows + ' of ' + DATA.board_size + ' verdicts (' + boot.verdict_stable_pct + '%) survive in at least 95% of draws, with a median of ' + boot.median_verdict_flips + ' verdicts flipping per draw. Categories with one or two live peers are noisy — the board says so here instead of printing a verdict as if it were certain.' }),
+      el('p', { class: 'sub', text: msLine })
+    );
+  }
+
+  function modelPanel() {
+    var m = DATA.model;
+    var multRows = DATA.category_effects.map(function (t) {
+      return el('tr', null,
+        el('td', { text: t.category }),
+        el('td', { class: 'num', text: String(t.live_peers) }),
+        el('td', { class: 'num', text: t.median_residual === null ? 'no live peers' : (t.median_residual >= 0 ? '+' : '') + t.median_residual.toFixed(3) }),
+        el('td', { class: 'num', text: fmtMult(t.effect) }),
+        el('td', { class: 'num', text: fmtMult(t.low_effect) })
+      );
+    });
+    return el('section', { class: 'panel model', id: 'methodology' },
+      el('h2', { text: 'How implied value is computed' }),
+      el('p', { class: 'sub', text: 'Every row is scored by one function of the snapshot figures. No protocol name is special-cased, and no row is hand-picked. The program re-derives everything from the snapshot each run: a future snapshot with new protocols re-ranks without code changes.' }),
+      el('div', { class: 'formula' },
+        'implied = round( tvl_usd x size multiple x category effect x (1 + clamp(change_7d, ' + m.growth_floor + ', ' + m.growth_cap + ') / 100 x ' + m.growth_weight + ') x (' + m.maturity_floor + ' + min(age_days, ' + m.maturity_days + ') / ' + m.maturity_days + ' x ' + m.maturity_range + ') x min(' + m.chain_cap + ', 1 + 0.02 x min(chains - 1, 10)) )'
+      ),
+      el('p', { class: 'sub', text: 'TVL and seven-day growth come from the snapshot. Age is the time since the protocol was first listed, the best record of how long it has run with no token; an unlisted age uses ' + m.unknown_age_days + ' days. Chain breadth is the number of chains the snapshot counts the protocol on, capped at ' + m.chain_cap + 'x. The combined multiple is capped at ' + m.multiple_cap + 'x; the size line itself falls with TVL, so a very large protocol prices at a small multiple by construction.' }),
+      el('h3', { text: 'The multiple is a size line times a category effect' }),
+      el('p', { class: 'sub', text: 'The size line is fitted on the snapshot\'s ' + DATA.live_peer_count + ' live-token peers: log(market-cap/TVL) = ' + DATA.size_fit.intercept.toFixed(2) + ' ' + (DATA.size_fit.slope < 0 ? '− ' : '+ ') + Math.abs(DATA.size_fit.slope).toFixed(2) + ' x log10(TVL), so market cap scales as TVL^' + DATA.size_fit.exponent.toFixed(2) + '. Each category\'s effect is the median of its live peers\' residuals from that line, shrunk toward no effect (1x) with weight n / (n + ' + m.shrink_prior + ') and capped at ' + m.median_cap + 'x, so one extreme peer cannot set its whole category\'s price; a category with no live peers takes no effect. The pure category comparable was tried first and measured worse out of sample — walk-forward 4.43x against this hybrid\'s 3.40x — because the size line carries real signal, so it stays as a named factor instead of being thrown away.' }),
       el('div', { class: 'table-wrap' },
         el('table', { class: 'mult-table' },
           el('thead', null, el('tr', null,
             el('th', { scope: 'col', text: 'Category' }),
             el('th', { scope: 'col', text: 'Live peers' }),
             el('th', { scope: 'col', text: 'Median residual (log)' }),
-            el('th', { scope: 'col', text: 'Effect used' })
+            el('th', { scope: 'col', text: 'Effect used' }),
+            el('th', { scope: 'col', text: 'Low effect' })
           )),
           el('tbody', null, multRows)
         )
       ),
+      el('h3', { text: 'What the model cannot see' }),
+      el('p', { class: 'sub', text: 'The snapshot carries ten fields per protocol and nothing else: no revenue, no fees, no token supply, no vesting or unlock schedule. So there is no revenue multiple here and no dilution adjustment — market cap is the value numerator, not fully diluted value, and the board never claims a token\'s future supply. A protocol that records no token may still have one its DefiLlama record does not carry. The model prices what the snapshot shows and says what it cannot.' }),
       el('h3', { text: 'The low band, and the farm verdict' }),
-      el('p', { class: 'sub', text: 'The 25th percentile of a category\'s live-peer residuals from the size line, shrunk the same way toward the 25th percentile of all residuals, gives a low-band effect, and the same arithmetic gives a low-band value: the cautious end of the band. Every farm plan ends with a verdict that nets the plan to the dollar — its gas spend against the low-band value — and the call is read off the low-band value: FARM at $2.5M and above, THIN at $1M, SKIP below. A farm earns a slice of a launch, never the whole implied value, so the call is made on the cautious end.' }),
+      el('p', { class: 'sub', text: 'The low-band multiple is the size line times the category\'s low effect: the 25th percentile of the category\'s residuals, shrunk the same way toward the 25th percentile of every peer\'s residuals (' + fmtMult(DATA.global_low_effect) + 'x). The same arithmetic gives a low-band value: the cautious end of the band. Every farm plan ends with a verdict that nets the plan to the dollar — its gas spend against the low-band value — and the call is read off the low-band value: FARM at $2.5M and above, THIN at $1M, SKIP below. A farm earns a slice of a launch, never the whole implied value, so the call is made on the cautious end.' }),
       el('h3', { text: 'What is ranked, and what is set aside' }),
       el('p', { class: 'sub', text: 'The board ranks all ' + DATA.watchlist_size + ' watchlist protocols plus ' + DATA.early_size + ' pre-token protocols below the $' + Math.round(DATA.floor_usd / 1e6) + 'M floor. Above the floor, only the watchlist\'s own definition decides: ' + DATA.set_aside_above_floor + ' protocols above the floor record no token but are wrapped, staked or bridged products of tokens that already trade (or versioned pools, or arms of another protocol), so they are set aside, not ranked — a wrapped token is not a protocol still waiting on a launch of its own. ' + DATA.set_aside_wrapped_below_floor + ' more below the floor fail the same tests. The Rising sort ranks by clamped growth times youth, for the earliest finds.' })
     );
@@ -523,7 +543,7 @@
       el('h3', { text: 'Implied value' }),
       el('div', { class: 'equation' },
         el('div', null, el('span', { text: 'TVL' }), el('b', { class: 'num', text: fmtUsd(row.tvl_usd) })),
-        el('div', null, el('span', { text: 'Size curve' }), el('b', { class: 'num', text: fmtMult(row.size_multiple) })),
+        el('div', null, el('span', { text: 'Size multiple' }), el('b', { class: 'num', text: fmtMult(row.size_multiple) })),
         el('div', null, el('span', { text: 'Category effect' }), el('b', { class: 'num', text: fmtMult(row.category_multiple) })),
         el('div', null, el('span', { text: 'Combined multiple' }), el('b', { class: 'num', text: fmtMult(row.multiple) })),
         el('div', null, el('span', { text: 'Seven-day growth' }), el('b', { class: 'num', text: fmtPct(row.change_7d) })),
@@ -560,13 +580,15 @@
     app.textContent = '';
     var shell = el('div', { class: 'shell' });
     if (state.method) {
-      // The methodology deep link shows the model panel first, so the OOS test and the size
-      // curve are on screen without relying on a scroll position.
+      // The methodology deep link shows the test panel and the model panel first, so the
+      // walk-forward test and the formula are on screen without relying on a scroll position.
       shell.appendChild(header());
+      shell.appendChild(testPanel());
       shell.appendChild(modelPanel());
     } else {
       shell.appendChild(header());
       shell.appendChild(lede());
+      if (state.tab === 'pre-token') shell.appendChild(testPanel());
       shell.appendChild(controls());
       shell.appendChild(state.tab === 'pre-token' ? boardTable() : liveTable());
       if (state.tab === 'pre-token') shell.appendChild(modelPanel());
