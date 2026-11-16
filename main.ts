@@ -1,4 +1,4 @@
-// Token Radar, radar-2 entry point (Node 22, standard library only).
+// Token Radar, radar-4 entry point (Node 22, standard library only).
 //
 // Run flow: read the sealed snapshot (a file, or a directory holding snapshot.json),
 // score every rankable pre-token protocol through lib/model.ts, write the ranked
