@@ -1,4 +1,4 @@
-// Token Radar's dashboard, radar-3. It reads window.RADAR (written beside dashboard/ by main.ts)
+// Token Radar's dashboard, radar-4. It reads window.RADAR (written beside dashboard/ by main.ts)
 // and renders the ranked board, a filterable table, a per-protocol detail drawer with the model's
 // own inputs and the protocol's farm plan, and the methodology behind the multiples — including the
 // out-of-sample test the model was scored on and the size curve it is priced from. No network:
@@ -422,23 +422,20 @@
 
   function modelPanel() {
     var m = DATA.model;
-    var multRows = DATA.category_multiples.map(function (t) {
+    var fit = DATA.size_fit;
+    var sizeFormula = 'exp(' + fit.intercept.toFixed(2) + (fit.slope < 0 ? ' - ' : ' + ') + Math.abs(fit.slope).toFixed(2) + ' x log10(tvl))';
+    var multRows = DATA.category_effects.map(function (t) {
       return el('tr', null,
         el('td', { text: t.category }),
         el('td', { class: 'num', text: String(t.live_peers) }),
-        el('td', { class: 'num', text: t.median_multiple === null ? 'no live peers' : fmtMult(t.median_multiple) }),
-        el('td', { class: 'num', text: fmtMult(t.multiple) })
+        el('td', { class: 'num', text: t.median_residual === null ? 'no live peers' : (t.median_residual >= 0 ? '+' : '') + t.median_residual.toFixed(2) }),
+        el('td', { class: 'num', text: fmtMult(t.effect) })
       );
     });
-    var curve = DATA.size_curve;
-    var sizeRows = curve.multiples.map(function (mult, i) {
-      var band = curve.band_names[i];
-      var range = i === 0 ? 'TVL up to ' + fmtUsd(curve.cuts[0]) : i === 1 ? 'TVL ' + fmtUsd(curve.cuts[0]) + ' to ' + fmtUsd(curve.cuts[1]) : 'TVL above ' + fmtUsd(curve.cuts[1]);
+    var sizeRows = fit.points.map(function (pt) {
       return el('tr', null,
-        el('td', { text: band }),
-        el('td', { text: range }),
-        el('td', { class: 'num', text: String(curve.counts[i]) }),
-        el('td', { class: 'num', text: fmtMult(mult) })
+        el('td', { text: 'TVL ' + fmtUsd(pt.tvl_usd) }),
+        el('td', { class: 'num', text: fmtMult(pt.multiple) })
       );
     });
     var oos = DATA.oos;
@@ -454,11 +451,14 @@
       el('h2', { text: 'How implied value is computed' }),
       el('p', { class: 'sub', text: 'Every row is scored by one function of the snapshot figures. No protocol name is special-cased, and no row is hand-picked. The program re-derives everything from the snapshot each run: a future snapshot with new protocols re-ranks without code changes.' }),
       el('div', { class: 'formula' },
-        'implied = round( tvl_usd x min(' + m.multiple_cap + ', size multiple x category multiple / ' + fmtMult(DATA.global_multiple) + ') x (1 + clamp(change_7d, ' + m.growth_floor + ', ' + m.growth_cap + ') / 100 x ' + m.growth_weight + ') x (' + m.maturity_floor + ' + min(age_days, ' + m.maturity_days + ') / ' + m.maturity_days + ' x ' + m.maturity_range + ') x min(' + m.chain_cap + ', 1 + 0.02 x (chains - 1)) )'
+        'implied = round( tvl_usd x min(' + m.multiple_cap + ', size(tvl) x category effect) x (1 + clamp(change_7d, ' + m.growth_floor + ', ' + m.growth_cap + ') / 100 x ' + m.growth_weight + ') x (' + m.maturity_floor + ' + min(age_days, ' + m.maturity_days + ') / ' + m.maturity_days + ' x ' + m.maturity_range + ') x min(' + m.chain_cap + ', 1 + 0.02 x (chains - 1)) )'
+      ),
+      el('div', { class: 'formula' },
+        'size(tvl) = ' + sizeFormula + ', fitted on the snapshot\'s live-token protocols; market cap scales as TVL^' + fit.exponent.toFixed(2) + '.'
       ),
       el('p', { class: 'sub', text: 'TVL and seven-day growth come from the snapshot. Age is the time since the protocol was first listed, the best record of how long it has run with no token; an unlisted age uses ' + m.unknown_age_days + ' days. Chain breadth is the number of chains the snapshot counts the protocol on, capped at ' + m.chain_cap + 'x.' }),
       el('h3', { text: 'The multiple is tested, not asserted' }),
-      el('p', { class: 'sub', text: 'The dated live-token protocols split at their median listing date, ' + oos.cut_date + ': the older half (' + oos.fit_n + ' tokens) fits the multiples, the newer half (' + oos.test_n + ' tokens) is scored without ever having been fitted. The table shows the median factor error — the typical factor by which a prediction misses the real market cap — and the share predicted within 2x. The size curve halves the error of category alone, which is why it is in the model. A model wrong by 3.5x on average says so here, in its own methodology.' }),
+      el('p', { class: 'sub', text: 'The dated live-token protocols split at their median listing date, ' + oos.cut_date + ': the older half (' + oos.fit_n + ' tokens) fits the multiples, the newer half (' + oos.test_n + ' tokens) is scored without ever having been fitted. The table shows the median factor error — the typical factor by which a prediction misses the real market cap — and the share predicted within 2x. The fitted log-size curve with its category effect cuts the error of the old three-band model by about a third, and of category alone by more than half. A model wrong by ' + oos.methods[0].median_factor_error.toFixed(1) + 'x on average says so here, in its own methodology.' }),
       el('div', { class: 'table-wrap' },
         el('table', { class: 'mult-table' },
           el('thead', null, el('tr', null,
@@ -471,33 +471,31 @@
         )
       ),
       el('h3', { text: 'The size curve' }),
-      el('p', { class: 'sub', text: 'Big protocols trade at a smaller multiple per TVL dollar than small ones. The live-token peers split into three TVL bands at their own terciles, and each band is priced at its own median market-cap-to-TVL ratio. A protocol\'s multiple is its size band\'s multiple times its category multiple, divided by the global median, capped at ' + m.multiple_cap + 'x.' }),
+      el('p', { class: 'sub', text: 'Market cap grows more slowly than TVL. Across the snapshot\'s ' + DATA.live_peer_count + ' live-token protocols, the log of the market-cap-to-TVL ratio falls against the log of TVL with slope ' + fit.slope.toFixed(2) + ', so market cap scales as TVL^' + fit.exponent.toFixed(2) + ': a protocol ten times as big is worth about three times as much, not ten times as much. The line is fitted by least squares on the live peers, and the table shows the multiple it gives at four TVLs. A protocol\'s multiple is the line\'s value at its TVL times its category effect, capped at ' + m.multiple_cap + 'x.' }),
       el('div', { class: 'table-wrap' },
         el('table', { class: 'mult-table' },
           el('thead', null, el('tr', null,
-            el('th', { scope: 'col', text: 'Size band' }),
-            el('th', { scope: 'col', text: 'TVL range' }),
-            el('th', { scope: 'col', text: 'Live peers' }),
-            el('th', { scope: 'col', text: 'Median mcap / TVL' })
+            el('th', { scope: 'col', text: 'Protocol size' }),
+            el('th', { scope: 'col', text: 'Multiple from the size line' })
           )),
           el('tbody', null, sizeRows)
         )
       ),
       el('h3', { text: 'Where the multiple comes from' }),
-      el('p', { class: 'sub', text: 'Each category is priced from the snapshot\'s own live-token protocols: the median market-cap-to-TVL ratio of its live peers, shrunk toward the global median of ' + fmtMult(DATA.global_multiple) + ' with weight n / (n + ' + m.shrink_prior + '), so a category with one or two peers cannot set its own price. The category median is capped at ' + m.median_cap + 'x before shrinkage and the multiple at ' + m.multiple_cap + 'x. A category with no live peers takes the global median.' }),
+      el('p', { class: 'sub', text: 'Each category sits somewhere off the size line. Its effect is the median of its live peers\' residuals from the fitted line — how far the category trades above or below what its size alone would say — shrunk toward no effect with weight n / (n + ' + m.shrink_prior + '), so a category with one or two peers cannot set its own price. The effect is capped at ' + m.median_cap + 'x and the combined multiple at ' + m.multiple_cap + 'x. A category with no live peers takes no effect (1.00x).' }),
       el('div', { class: 'table-wrap' },
         el('table', { class: 'mult-table' },
           el('thead', null, el('tr', null,
             el('th', { scope: 'col', text: 'Category' }),
             el('th', { scope: 'col', text: 'Live peers' }),
-            el('th', { scope: 'col', text: 'Median mcap / TVL' }),
-            el('th', { scope: 'col', text: 'Multiple used' })
+            el('th', { scope: 'col', text: 'Median residual (log)' }),
+            el('th', { scope: 'col', text: 'Effect used' })
           )),
           el('tbody', null, multRows)
         )
       ),
       el('h3', { text: 'The low band, and the farm verdict' }),
-      el('p', { class: 'sub', text: 'The 25th percentile of a category\'s live-peer ratios, shrunk the same way, gives a low-band multiple, and the same arithmetic gives a low-band value: the cautious end of the band. Every farm plan ends with a verdict that nets the plan to the dollar — its gas spend against the low-band value — and the call is read off the low-band value: FARM at $2.5M and above, THIN at $1M, SKIP below. A farm earns a slice of a launch, never the whole implied value, so the call is made on the cautious end.' }),
+      el('p', { class: 'sub', text: 'The 25th percentile of a category\'s live-peer residuals from the size line, shrunk the same way toward the 25th percentile of all residuals, gives a low-band effect, and the same arithmetic gives a low-band value: the cautious end of the band. Every farm plan ends with a verdict that nets the plan to the dollar — its gas spend against the low-band value — and the call is read off the low-band value: FARM at $2.5M and above, THIN at $1M, SKIP below. A farm earns a slice of a launch, never the whole implied value, so the call is made on the cautious end.' }),
       el('h3', { text: 'What is ranked, and what is set aside' }),
       el('p', { class: 'sub', text: 'The board ranks all ' + DATA.watchlist_size + ' watchlist protocols plus ' + DATA.early_size + ' pre-token protocols below the $' + Math.round(DATA.floor_usd / 1e6) + 'M floor. Above the floor, only the watchlist\'s own definition decides: ' + DATA.set_aside_above_floor + ' protocols above the floor record no token but are wrapped, staked or bridged products of tokens that already trade (or versioned pools, or arms of another protocol), so they are set aside, not ranked — a wrapped token is not a protocol still waiting on a launch of its own. ' + DATA.set_aside_wrapped_below_floor + ' more below the floor fail the same tests. The Rising sort ranks by clamped growth times youth, for the earliest finds.' })
     );
@@ -525,8 +523,8 @@
       el('h3', { text: 'Implied value' }),
       el('div', { class: 'equation' },
         el('div', null, el('span', { text: 'TVL' }), el('b', { class: 'num', text: fmtUsd(row.tvl_usd) })),
-        el('div', null, el('span', { text: 'Size multiple' }), el('b', { class: 'num', text: fmtMult(row.size_multiple) })),
-        el('div', null, el('span', { text: 'Category multiple' }), el('b', { class: 'num', text: fmtMult(row.category_multiple) })),
+        el('div', null, el('span', { text: 'Size curve' }), el('b', { class: 'num', text: fmtMult(row.size_multiple) })),
+        el('div', null, el('span', { text: 'Category effect' }), el('b', { class: 'num', text: fmtMult(row.category_multiple) })),
         el('div', null, el('span', { text: 'Combined multiple' }), el('b', { class: 'num', text: fmtMult(row.multiple) })),
         el('div', null, el('span', { text: 'Seven-day growth' }), el('b', { class: 'num', text: fmtPct(row.change_7d) })),
         el('div', null, el('span', { text: 'Growth multiplier' }), el('b', { class: 'num', text: String(row.growth_multiplier) })),
