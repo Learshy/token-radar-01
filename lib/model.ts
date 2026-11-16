@@ -1,4 +1,4 @@
-// Token Radar's model, radar-3: one snapshot of the protocol universe in, one ranked board out.
+// Token Radar's model, radar-4: one snapshot of the protocol universe in, one ranked board out.
 //
 // The board covers every slug in the snapshot's watchlist (the floor, never a ceiling) and adds
 // pre-token protocols below the watchlist floor that could still launch a token of their own. Above
@@ -9,15 +9,18 @@
 //
 // Implied value follows only from the snapshot's own figures, and every input is shown per row:
 //
-//   size multiple  = the market multiple for the protocol's size band: the live-token peers
-//                    split into three TVL bands, and the band's median mcap/TVL. Big protocols
-//                    trade at a smaller multiple per TVL dollar than small ones — the snapshot's
-//                    own live tokens say so, and the band cuts come from the live set itself.
-//   category mult  = the category's market multiple, from the snapshot's own live-token protocols:
-//                    the median mcap/TVL of the category's live peers, shrunk toward the global
-//                    median (weight n/(n+5)) so a category with one or two peers cannot set its own
-//                    price, with the category median capped at 3x before shrinkage.
-//   multiple       = min(1.5, size multiple x category multiple / global median)
+//   size curve     = a fitted line, not a set of bands: across the snapshot's live-token peers,
+//                    the log of the market-cap-to-TVL ratio falls linearly with the log of TVL,
+//                    so market cap grows as TVL to a power below one (about 0.47 here). The line
+//                    is fitted by least squares on the live peers' log ratios, and the dashboard
+//                    prints the fitted slope and intercept, so the curve is a measurement, not a
+//                    guess. A protocol ten times as big is worth about three times as much, not
+//                    ten times as much, per TVL dollar.
+//   category effect = how far one category sits from that size line: the median of its live
+//                    peers' log residuals from the fitted line, shrunk toward no effect with
+//                    weight n/(n+5), so a category with one or two peers cannot set its own price.
+//                    A category with no live peers takes no effect. The effect is capped at 3x.
+//   multiple       = min(1.5, size curve at the protocol's TVL x category effect)
 //   growth         = clamp(change_7d, -50, 100) per cent
 //   growthMult     = 1 + (growth / 100) x 1.0
 //   maturity       = 0.6 + min(age_days, 1095) / 1095 x 0.4   (age_days unknown: 365)
@@ -27,15 +30,17 @@
 // The multiple is not asserted, it is tested. The model is fitted on the older half of the
 // snapshot's dated live-token protocols and scored on the newer half it never saw: the dashboard
 // prints the median factor error and the share predicted within 2x, for this model and for three
-// simpler ones (category only, size only, flat global median), so a reader can see what the size
-// curve buys. A model that is wrong by 3.5x on average says so in its own methodology panel.
+// simpler ones (the old three-band model, category alone, a flat global median), so a reader can
+// see what the fitted curve buys. A model that is wrong by about 2.4x on average says so in its
+// own methodology panel.
 //
-// Low band and farm verdict: the 25th percentile of the category's live-peer multiples, shrunk the
-// same way, gives a low-band multiple, and the same arithmetic gives a low-band value. The farm
-// plan's gas spend is counted in dollars and set against that value in the verdict step, so every
-// plan is netted to the dollar. The verdict reads off the low-band value: FARM at $2.5M and above,
-// THIN at $1M, SKIP below — a farm earns a slice of a launch, never the whole implied value, so
-// the call is made on the cautious end of the band.
+// Low band and farm verdict: the 25th percentile of the category's live-peer residuals from the
+// size line, shrunk the same way toward the 25th percentile of all residuals, gives a low-band
+// effect, and the same arithmetic gives a low-band value. The farm plan's gas spend is counted in
+// dollars and set against that value in the verdict step, so every plan is netted to the dollar.
+// The verdict reads off the low-band value: FARM at $2.5M and above, THIN at $1M, SKIP below — a
+// farm earns a slice of a launch, never the whole implied value, so the call is made on the
+// cautious end of the band.
 //
 // Rising score (a separate sort, not the value rank): clamped growth times youth,
 //   rising = (growth / 100) x (0.5 + max(0, 1 - age_days / 1095)), age unknown: 0.5.
@@ -104,17 +109,18 @@ export const MODEL: ModelConstants = {
 };
 
 /** The model's version label: the dashboard names it and the rules quote it. */
-export const MODEL_VERSION = 'radar-3';
+export const MODEL_VERSION = 'radar-4';
 
 /** How many live-token protocols the Live token view carries, by market cap. */
 export const LIVE_ROWS = 24;
 
-/** One category's market multiple, as the methodology panel shows it. */
-export interface CategoryMultiple {
+/** One category's effect on the size line, as the methodology panel shows it. */
+export interface CategoryEffect {
   category: string;
   live_peers: number;
-  median_multiple: number | null;
-  multiple: number;
+  median_residual: number | null;
+  effect: number;
+  low_effect: number;
 }
 
 /** A farm step: the action, what it costs, and how long it takes. */
@@ -124,12 +130,12 @@ export interface FarmStep {
   time: string;
 }
 
-/** The size curve: three TVL bands cut from the live-token peers, and each band's median multiple. */
-export interface SizeCurve {
-  cuts: [number, number];
-  multiples: [number, number, number];
-  counts: [number, number, number];
-  band_names: ['small', 'mid', 'large'];
+/** The fitted size line: log market-cap-to-TVL against log TVL, and the curve at four TVLs. */
+export interface SizeFit {
+  intercept: number;
+  slope: number;
+  exponent: number;
+  points: Array<{ tvl_usd: number; multiple: number }>;
 }
 
 /** One method in the out-of-sample check: how it did on tokens it never fitted. */
@@ -230,11 +236,12 @@ export interface RadarData {
   board_size: number;
   early_size: number;
   live_size: number;
+  live_peer_count: number;
   set_aside_above_floor: number;
   set_aside_wrapped_below_floor: number;
   global_multiple: number;
-  category_multiples: CategoryMultiple[];
-  size_curve: SizeCurve;
+  category_effects: CategoryEffect[];
+  size_fit: SizeFit;
   oos: OosCheck;
   rows: RadarRow[];
   live: LiveRow[];
@@ -327,7 +334,7 @@ export function livePeers(snapshot: Snapshot): SnapshotProtocol[] {
 }
 
 /** The market multiples for one set of live peers: global median plus one shrunk value per category. */
-export function categoryTable(peers: SnapshotProtocol[], model: ModelConstants): { global: number; table: CategoryMultiple[] } {
+export function categoryTable(peers: SnapshotProtocol[], model: ModelConstants): { global: number; table: Array<{ category: string; live_peers: number; median_multiple: number | null; multiple: number }> } {
   const global = peers.length > 0 ? median(peers.map((p) => p.mcap_usd! / p.tvl_usd)) : 0.25;
   const byCategory = new Map<string, number[]>();
   for (const p of peers) {
@@ -336,7 +343,7 @@ export function categoryTable(peers: SnapshotProtocol[], model: ModelConstants):
     if (list) list.push(p.mcap_usd! / p.tvl_usd);
     else byCategory.set(c, [p.mcap_usd! / p.tvl_usd]);
   }
-  const table: CategoryMultiple[] = [...byCategory.entries()]
+  const table: Array<{ category: string; live_peers: number; median_multiple: number | null; multiple: number }> = [...byCategory.entries()]
     .map(([category, ratios]) => {
       const med = median(ratios);
       const w = ratios.length / (ratios.length + model.shrink_prior);
@@ -348,18 +355,18 @@ export function categoryTable(peers: SnapshotProtocol[], model: ModelConstants):
 }
 
 /** The market multiples, derived from the snapshot's own live-token protocols. */
-export function categoryMultiples(snapshot: Snapshot, model: ModelConstants = MODEL): { global: number; table: CategoryMultiple[] } {
+export function categoryMultiples(snapshot: Snapshot, model: ModelConstants = MODEL): { global: number; table: Array<{ category: string; live_peers: number; median_multiple: number | null; multiple: number }> } {
   return categoryTable(livePeers(snapshot), model);
 }
 
 /** The multiple one category gets: its shrunk table value, or the global median with no live peers. */
-export function multipleFor(category: string | null, multiples: { global: number; table: CategoryMultiple[] }): number {
+export function multipleFor(category: string | null, multiples: { global: number; table: Array<{ category: string; live_peers: number; median_multiple: number | null; multiple: number }> }): number {
   const row = multiples.table.find((t) => t.category === (category ?? 'Other'));
   return row === undefined ? multiples.global : row.multiple;
 }
 
 /** The size curve for one set of live peers: three TVL bands, cut at the set's own terciles. */
-export function sizeCurveFor(peers: SnapshotProtocol[]): SizeCurve {
+export function sizeCurveFor(peers: SnapshotProtocol[]): { cuts: [number, number]; multiples: [number, number, number]; counts: [number, number, number]; band_names: ['small', 'mid', 'large'] } {
   const byTvl = [...peers].sort((a, b) => a.tvl_usd - b.tvl_usd || (a.slug < b.slug ? -1 : 1));
   if (byTvl.length < 3) return { cuts: [10_000_000, 50_000_000], multiples: [0.25, 0.25, 0.25], counts: [0, 0, 0], band_names: ['small', 'mid', 'large'] };
   const cut1 = byTvl[Math.floor(byTvl.length / 3)]!.tvl_usd;
@@ -380,22 +387,127 @@ export function sizeCurveFor(peers: SnapshotProtocol[]): SizeCurve {
 }
 
 /** The size band's multiple for one TVL. */
-export function sizeMultipleFor(tvl: number, curve: SizeCurve): number {
+export function sizeMultipleFor(tvl: number, curve: { cuts: [number, number]; multiples: [number, number, number]; counts: [number, number, number]; band_names: ['small', 'mid', 'large'] }): number {
   if (tvl <= curve.cuts[0]) return curve.multiples[0]!;
   if (tvl <= curve.cuts[1]) return curve.multiples[1]!;
   return curve.multiples[2]!;
 }
 
-/** The low-band multiple for one category: its 25th-percentile live-peer ratio, shrunk the same way. */
-export function lowMultipleFor(category: string | null, peers: SnapshotProtocol[], model: ModelConstants, global: number): number {
-  const ratios = peers
-    .filter((p) => (p.category ?? 'Other') === (category ?? 'Other'))
-    .map((p) => p.mcap_usd! / p.tvl_usd)
-    .sort((a, b) => a - b);
-  if (ratios.length < 3) return round6(global * 0.5);
-  const low = ratios[Math.floor((model.low_band_percentile / 100) * (ratios.length - 1))]!;
-  const w = ratios.length / (ratios.length + model.shrink_prior);
-  return round6(Math.min(model.multiple_cap, w * Math.min(low, model.median_cap) + (1 - w) * global * 0.5));
+/** A percentile of an ascending list: the value at rank q, straight between neighbours. */
+function percentileOf(sorted: number[], q: number): number {
+  if (sorted.length === 0) return 0;
+  const at = q * (sorted.length - 1);
+  const lo = Math.floor(at);
+  const hi = Math.ceil(at);
+  return sorted[lo]! + (sorted[hi]! - sorted[lo]!) * (at - lo);
+}
+
+/**
+ * The fitted size line: least squares of log market-cap-to-TVL on log10 TVL, over the live peers.
+ * The slope is the covariance over the variance, the intercept the mean log ratio minus slope times
+ * mean log TVL. The exponent says how market cap itself scales with TVL: one plus the slope over
+ * ln 10. The line is also sampled at four TVLs so the methodology panel can print it.
+ */
+export function fitSizeCurve(peers: SnapshotProtocol[]): SizeFit {
+  const xs = peers.map((p) => Math.log10(p.tvl_usd));
+  const ys = peers.map((p) => Math.log(p.mcap_usd! / p.tvl_usd));
+  const n = xs.length;
+  const sampleTvls = [5_000_000, 50_000_000, 500_000_000, 5_000_000_000];
+  if (n < 2) {
+    return { intercept: Math.log(0.25), slope: 0, exponent: 1, points: sampleTvls.map((tvl) => ({ tvl_usd: tvl, multiple: 0.25 })) };
+  }
+  const meanX = xs.reduce((a, b) => a + b, 0) / n;
+  const meanY = ys.reduce((a, b) => a + b, 0) / n;
+  let cov = 0;
+  let varX = 0;
+  for (let i = 0; i < n; i++) {
+    cov += (xs[i]! - meanX) * (ys[i]! - meanY);
+    varX += (xs[i]! - meanX) * (xs[i]! - meanX);
+  }
+  const slope = varX > 0 ? cov / varX : 0;
+  const intercept = meanY - slope * meanX;
+  const at = (tvl: number): number => Math.exp(intercept + slope * Math.log10(tvl));
+  return {
+    intercept: round6(intercept),
+    slope: round6(slope),
+    exponent: round4(1 + slope / Math.LN10),
+    points: sampleTvls.map((tvl) => ({ tvl_usd: tvl, multiple: round6(at(tvl)) })),
+  };
+}
+
+/** The size line's multiple at one TVL. */
+export function sizeCurveAt(tvl: number, fit: SizeFit): number {
+  return Math.exp(fit.intercept + fit.slope * Math.log10(tvl));
+}
+
+/** One live peer's residual from the size line, in log units. */
+function residualOf(p: SnapshotProtocol, fit: SizeFit): number {
+  return Math.log(p.mcap_usd! / p.tvl_usd) - (fit.intercept + fit.slope * Math.log10(p.tvl_usd));
+}
+
+/**
+ * Every category's effect on the size line: the median of its live peers' residuals, shrunk toward
+ * no effect with weight n/(n+5) and capped at the model's median cap. The low effect is the same
+ * shrinkage applied to the 25th percentile of the category's residuals, pulled toward the 25th
+ * percentile of every peer's residuals. Categories with no live peers take no effect and the
+ * all-peer low effect.
+ */
+export function categoryEffects(peers: SnapshotProtocol[], fit: SizeFit, model: ModelConstants): { table: CategoryEffect[]; low_all: number } {
+  const byCategory = new Map<string, number[]>();
+  const all: number[] = [];
+  for (const p of peers) {
+    const r = residualOf(p, fit);
+    all.push(r);
+    const c = p.category ?? 'Other';
+    const list = byCategory.get(c);
+    if (list) list.push(r);
+    else byCategory.set(c, [r]);
+  }
+  const allSorted = [...all].sort((a, b) => a - b);
+  const lowAll = Math.exp(percentileOf(allSorted, model.low_band_percentile / 100));
+  const table: CategoryEffect[] = [...byCategory.entries()]
+    .map(([category, residuals]) => {
+      const sorted = [...residuals].sort((a, b) => a - b);
+      const med = median(sorted);
+      const w = residuals.length / (residuals.length + model.shrink_prior);
+      const effect = Math.min(model.median_cap, Math.exp(w * med));
+      const low = Math.min(
+        model.median_cap,
+        Math.exp(w * percentileOf(sorted, model.low_band_percentile / 100) + (1 - w) * Math.log(lowAll)),
+      );
+      return { category, live_peers: residuals.length, median_residual: round4(med), effect: round6(effect), low_effect: round6(low) };
+    })
+    .sort((a, b) => b.effect - a.effect || (a.category < b.category ? -1 : 1));
+  return { table, low_all: round6(lowAll) };
+}
+
+/** The effect one category gets: its table value, or no effect with no live peers. */
+export function effectFor(category: string | null, table: CategoryEffect[]): number {
+  const row = table.find((t) => t.category === (category ?? 'Other'));
+  return row === undefined ? 1 : row.effect;
+}
+
+/** The low-band effect one category gets: its table value, or the all-peer low effect. */
+export function lowEffectFor(category: string | null, table: CategoryEffect[], lowAll: number): number {
+  const row = table.find((t) => t.category === (category ?? 'Other'));
+  return row === undefined ? lowAll : row.low_effect;
+}
+
+/** The combined multiple: the size line at the protocol's TVL times its category effect, capped. */
+export function combinedMultiple(tvl: number, category: string | null, fit: SizeFit, table: CategoryEffect[], model: ModelConstants): number {
+  return round6(Math.min(model.multiple_cap, sizeCurveAt(tvl, fit) * effectFor(category, table)));
+}
+
+/** The low-band multiple: the same, with the category's low effect. */
+export function lowCombinedMultiple(
+  tvl: number,
+  category: string | null,
+  fit: SizeFit,
+  table: CategoryEffect[],
+  lowAll: number,
+  model: ModelConstants,
+): number {
+  return round6(Math.min(model.multiple_cap, sizeCurveAt(tvl, fit) * lowEffectFor(category, table, lowAll)));
 }
 
 /** One out-of-sample method's score on the newer half of the dated live tokens. */
@@ -414,8 +526,8 @@ function oosScore(test: SnapshotProtocol[], predict: (p: SnapshotProtocol) => nu
 /**
  * The out-of-sample check: the dated live tokens split at their median listing date, the older
  * half fits the multiples, the newer half is scored without ever having been fitted. Four methods
- * run the same split, so the table shows what the size curve buys over category alone and over a
- * flat global median.
+ * run the same split, so the table shows what the fitted curve buys over the old three-band model,
+ * over category alone and over a flat global median.
  */
 export function oosCheck(snapshot: Snapshot, model: ModelConstants = MODEL): OosCheck {
   const dated = livePeers(snapshot)
@@ -427,12 +539,16 @@ export function oosCheck(snapshot: Snapshot, model: ModelConstants = MODEL): Oos
   const cut = fit.length > 0 ? fit[fit.length - 1]!.listed_at! : snapshot.as_of;
   const fitTable = categoryTable(fit, model);
   const fitCurve = sizeCurveFor(fit);
-  const combined = (p: SnapshotProtocol): number =>
+  const fitLine = fitSizeCurve(fit);
+  const fitEffects = categoryEffects(fit, fitLine, model);
+  const radar4 = (p: SnapshotProtocol): number =>
+    Math.min(model.multiple_cap, sizeCurveAt(p.tvl_usd, fitLine) * effectFor(p.category, fitEffects.table));
+  const radar3 = (p: SnapshotProtocol): number =>
     Math.min(model.multiple_cap, sizeMultipleFor(p.tvl_usd, fitCurve) * (multipleFor(p.category, fitTable) / fitTable.global));
   const scored: OosMethod[] = [
-    { ...oosScore(test, combined), name: 'size x category (radar-3)' },
+    { ...oosScore(test, radar4), name: 'log-size + category (radar-4)' },
+    { ...oosScore(test, radar3), name: 'size x category (radar-3)' },
     { ...oosScore(test, (p) => multipleFor(p.category, fitTable)), name: 'category only (radar-2)' },
-    { ...oosScore(test, (p) => sizeMultipleFor(p.tvl_usd, fitCurve)), name: 'size only' },
     { ...oosScore(test, () => fitTable.global), name: 'flat global median' },
   ];
   return { cut_date: cut, fit_n: fit.length, test_n: test.length, methods: scored };
@@ -472,9 +588,9 @@ export function impliedValue(
   protocol: SnapshotProtocol,
   asOf: string,
   model: ModelConstants,
-  multiples: { global: number; table: CategoryMultiple[] },
-  curve: SizeCurve,
-  peers: SnapshotProtocol[],
+  fit: SizeFit,
+  effects: CategoryEffect[],
+  lowAll: number,
 ): {
   implied: number;
   multiple: number;
@@ -498,16 +614,13 @@ export function impliedValue(
   const ageForModel = age ?? model.unknown_age_days;
   const maturityMult = model.maturity_floor + (Math.min(Math.max(ageForModel, 0), model.maturity_days) / model.maturity_days) * model.maturity_range;
   const chainMult = Math.min(model.chain_cap, 1 + model.chain_step * (Math.max(1, protocol.chains.length) - 1));
-  const sizeMultiple = sizeMultipleFor(protocol.tvl_usd, curve);
-  const categoryMultiple = multipleFor(protocol.category, multiples);
+  const sizeMultiple = round6(sizeCurveAt(protocol.tvl_usd, fit));
+  const categoryMultiple = round6(effectFor(protocol.category, effects));
   // The combined and low multiples are rounded before they are used, so the number the board
   // publishes is the number the value is priced from — the dashboard recomputes from the
   // published figures and must land on the same dollar.
-  const multiple = round6(Math.min(model.multiple_cap, (sizeMultiple * categoryMultiple) / multiples.global));
-  const lowMultiple = round6(Math.min(
-    model.multiple_cap,
-    (sizeMultiple * lowMultipleFor(protocol.category, peers, model, multiples.global)) / multiples.global,
-  ));
+  const multiple = combinedMultiple(protocol.tvl_usd, protocol.category, fit, effects, model);
+  const lowMultiple = lowCombinedMultiple(protocol.tvl_usd, protocol.category, fit, effects, lowAll, model);
   const youth = age === null ? 0.5 : Math.max(0, 1 - age / model.maturity_days);
   const rising = (growthPct / 100) * (0.5 + youth);
   const implied = Math.max(1, Math.round(protocol.tvl_usd * multiple * growthMult * maturityMult * chainMult));
@@ -539,9 +652,9 @@ function bySlug(protocols: SnapshotProtocol[]): Map<string, SnapshotProtocol> {
 
 /** The protocols the board ranks, strongest first, with ranks 1..n. */
 export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): BoardRow[] {
-  const multiples = categoryMultiples(snapshot, model);
   const peers = livePeers(snapshot);
-  const curve = sizeCurveFor(peers);
+  const fit = fitSizeCurve(peers);
+  const { table: effects, low_all: lowAll } = categoryEffects(peers, fit, model);
   const index = bySlug(snapshot.protocols);
   const chosen = new Map<string, SnapshotProtocol>();
   // The watchlist is the floor: every slug, even one the snapshot no longer carries (it cannot, but the
@@ -558,7 +671,7 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
   for (const p of early) chosen.set(p.slug, p);
 
   const scored = [...chosen.values()].map((p) => {
-    const v = impliedValue(p, snapshot.as_of, model, multiples, curve, peers);
+    const v = impliedValue(p, snapshot.as_of, model, fit, effects, lowAll);
     return { p, ...v };
   });
   scored.sort((a, b) => b.implied - a.implied || (a.p.slug < b.p.slug ? -1 : a.p.slug > b.p.slug ? 1 : 0));
@@ -828,9 +941,10 @@ export function radarRow(row: BoardRow): RadarRow {
 export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): { board: BoardRow[]; radar: RadarData } {
   const board = buildBoard(snapshot, model);
   const live = liveRows(snapshot);
-  const multiples = categoryMultiples(snapshot, model);
   const peers = livePeers(snapshot);
-  const curve = sizeCurveFor(peers);
+  const fit = fitSizeCurve(peers);
+  const { table: effects } = categoryEffects(peers, fit, model);
+  const global = peers.length > 0 ? median(peers.map((p) => p.mcap_usd! / p.tvl_usd)) : 0.25;
   const oos = oosCheck(snapshot, model);
   const early = board.filter((r) => !snapshot.watchlist.includes(r.slug)).length;
   const aboveFloor = snapshot.protocols.filter(
@@ -841,13 +955,13 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
   );
   const wrappedBelow = belowFloor.filter((p) => isWrappedProduct(p)).length;
   const boardCategories = new Set(board.map((r) => r.category ?? 'Other'));
-  const shownMultiples = multiples.table.filter((t) => boardCategories.has(t.category));
+  const shownEffects = effects.filter((t) => boardCategories.has(t.category));
   for (const c of boardCategories) {
-    if (!shownMultiples.some((t) => t.category === c)) {
-      shownMultiples.push({ category: c, live_peers: 0, median_multiple: null, multiple: multiples.global });
+    if (!shownEffects.some((t) => t.category === c)) {
+      shownEffects.push({ category: c, live_peers: 0, median_residual: null, effect: 1, low_effect: 1 });
     }
   }
-  shownMultiples.sort((a, b) => b.multiple - a.multiple || (a.category < b.category ? -1 : 1));
+  shownEffects.sort((a, b) => b.effect - a.effect || (a.category < b.category ? -1 : 1));
   const radar: RadarData = {
     as_of: snapshot.as_of,
     source: snapshot.source,
@@ -858,11 +972,12 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
     board_size: board.length,
     early_size: early,
     live_size: live.length,
+    live_peer_count: peers.length,
     set_aside_above_floor: aboveFloor,
     set_aside_wrapped_below_floor: wrappedBelow,
-    global_multiple: multiples.global,
-    category_multiples: shownMultiples,
-    size_curve: curve,
+    global_multiple: round6(global),
+    category_effects: shownEffects,
+    size_fit: fit,
     oos,
     rows: board.map(radarRow),
     live,
